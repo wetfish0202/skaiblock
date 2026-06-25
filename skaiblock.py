@@ -8,8 +8,8 @@ from collections import defaultdict
 from html import escape
 from pathlib import Path
 
+import google.generativeai as genai
 from dotenv import load_dotenv
-from openai import AsyncOpenAI
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
@@ -18,15 +18,15 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 load_dotenv()
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 ADMIN_TELEGRAM_IDS = {
     int(x.strip())
     for x in os.environ.get("ADMIN_TELEGRAM_IDS", "").split(",")
     if x.strip()
 }
 
-MODEL_NAME = os.environ.get("MODEL_NAME", "gpt-4.1-mini")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "text-embedding-3-small")
+MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.0-flash")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "models/text-embedding-004")
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", "data/skaiblock.db"))
 PATCHNOTES_PATH = Path(os.environ.get("PATCHNOTES_PATH", "data/patchnotes"))
 
@@ -67,8 +67,9 @@ rate_history = defaultdict(list)
 def require_config():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN environment variable.")
-    if not OPENAI_API_KEY:
-        raise RuntimeError("Missing OPENAI_API_KEY environment variable.")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
+    genai.configure(api_key=GEMINI_API_KEY)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -190,11 +191,18 @@ def read_patchnote(path: Path) -> dict:
     }
 
 
-async def embed_texts(client: AsyncOpenAI, texts: list[str]) -> list[list[float]]:
+async def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    response = await client.embeddings.create(model=EMBEDDING_MODEL, input=texts)
-    return [item.embedding for item in response.data]
+    embeddings = []
+    for text in texts:
+        result = genai.embed_content(
+            model=EMBEDDING_MODEL,
+            content=text,
+            task_type="retrieval_document",
+        )
+        embeddings.append(result["embedding"])
+    return embeddings
 
 
 async def ingest_patchnotes() -> int:
@@ -204,13 +212,12 @@ async def ingest_patchnotes() -> int:
         if path.suffix.lower() in {".txt", ".md", ".json"}
     )
 
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     rows = []
 
     for path in files:
         source = read_patchnote(path)
         chunks = chunk_text(source["content"])
-        embeddings = await embed_texts(client, chunks)
+        embeddings = await embed_texts(chunks)
 
         for index, (content, embedding) in enumerate(zip(chunks, embeddings)):
             rows.append({
@@ -289,9 +296,12 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 async def retrieve_chunks(question: str) -> list[dict]:
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
-    response = await client.embeddings.create(model=EMBEDDING_MODEL, input=question)
-    query_embedding = response.data[0].embedding
+    result = genai.embed_content(
+        model=EMBEDDING_MODEL,
+        content=question,
+        task_type="retrieval_query",
+    )
+    query_embedding = result["embedding"]
 
     scored = []
     for chunk in load_chunks():
@@ -341,22 +351,20 @@ async def answer_question(question: str, chunks: list[dict]) -> str:
             f"<code>{PATCHNOTES_PATH}</code>, then run <code>/reload</code>."
         )
 
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY)
     context = build_context(chunks)
-
-    response = await client.chat.completions.create(
-        model=MODEL_NAME,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {
-                "role": "user",
-                "content": f"Question:\n{question}\n\nPatch-note excerpts:\n{context}",
-            },
-        ],
-        temperature=0.2,
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Question:\n{question}\n\n"
+        f"Patch-note excerpts:\n{context}"
     )
 
-    answer = escape(response.choices[0].message.content.strip())
+    model = genai.GenerativeModel(MODEL_NAME)
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(temperature=0.2),
+    )
+
+    answer = escape(response.text.strip())
     resources = build_resources(chunks)
     return f"{answer}\n\n{resources}" if resources else answer
 
