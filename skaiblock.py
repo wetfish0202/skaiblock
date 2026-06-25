@@ -8,7 +8,8 @@ from collections import defaultdict
 from html import escape
 from pathlib import Path
 
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.constants import ParseMode
@@ -26,7 +27,7 @@ ADMIN_TELEGRAM_IDS = {
 }
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "gemini-2.0-flash")
-EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "models/text-embedding-004")
+EMBEDDING_MODEL = os.environ.get("EMBEDDING_MODEL", "gemini-embedding-001")
 DATABASE_PATH = Path(os.environ.get("DATABASE_PATH", "data/skaiblock.db"))
 PATCHNOTES_PATH = Path(os.environ.get("PATCHNOTES_PATH", "data/patchnotes"))
 
@@ -63,13 +64,21 @@ ON patchnote_chunks(source_id);
 
 rate_history = defaultdict(list)
 
+_client: genai.Client | None = None
+
+
+def get_client() -> genai.Client:
+    global _client
+    if _client is None:
+        _client = genai.Client(api_key=GEMINI_API_KEY)
+    return _client
+
 
 def require_config():
     if not BOT_TOKEN:
         raise RuntimeError("Missing BOT_TOKEN environment variable.")
     if not GEMINI_API_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY environment variable.")
-    genai.configure(api_key=GEMINI_API_KEY)
 
 
 def connect_db() -> sqlite3.Connection:
@@ -194,15 +203,13 @@ def read_patchnote(path: Path) -> dict:
 async def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
-    embeddings = []
-    for text in texts:
-        result = genai.embed_content(
-            model=EMBEDDING_MODEL,
-            content=text,
-            task_type="retrieval_document",
-        )
-        embeddings.append(result["embedding"])
-    return embeddings
+    client = get_client()
+    response = client.models.embed_content(
+        model=EMBEDDING_MODEL,
+        contents=texts,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
+    )
+    return [e.values for e in response.embeddings]
 
 
 async def ingest_patchnotes() -> int:
@@ -296,12 +303,13 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 async def retrieve_chunks(question: str) -> list[dict]:
-    result = genai.embed_content(
+    client = get_client()
+    response = client.models.embed_content(
         model=EMBEDDING_MODEL,
-        content=question,
-        task_type="retrieval_query",
+        contents=question,
+        config=types.EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
     )
-    query_embedding = result["embedding"]
+    query_embedding = response.embeddings[0].values
 
     scored = []
     for chunk in load_chunks():
@@ -351,6 +359,7 @@ async def answer_question(question: str, chunks: list[dict]) -> str:
             f"<code>{PATCHNOTES_PATH}</code>, then run <code>/reload</code>."
         )
 
+    client = get_client()
     context = build_context(chunks)
     prompt = (
         f"{SYSTEM_PROMPT}\n\n"
@@ -358,10 +367,10 @@ async def answer_question(question: str, chunks: list[dict]) -> str:
         f"Patch-note excerpts:\n{context}"
     )
 
-    model = genai.GenerativeModel(MODEL_NAME)
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(temperature=0.2),
+    response = client.models.generate_content(
+        model=MODEL_NAME,
+        contents=prompt,
+        config=types.GenerateContentConfig(temperature=0.2),
     )
 
     answer = escape(response.text.strip())
